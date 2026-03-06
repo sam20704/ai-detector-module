@@ -1,6 +1,5 @@
 """
 reasoning_prompt.py
-
 Master Prompt Construction Module for Forensic Reasoning.
 
 Builds structured system and user prompts consumed by Azure OpenAI
@@ -24,7 +23,17 @@ Does NOT modify any existing detector files.
 Changelog:
   v2.0.0 — Initial production version
   v2.1.0 — Updated for Issue 3: "multiple_signals" handling in validation
-            and system prompt edge case instructions
+           and system prompt edge case instructions
+  v2.2.0 — Rule 1: Added SIGNAL INTERPRETATION AUTHORITY section instructing
+           the LLM to treat pre-interpreted forensic signal descriptions as
+           primary evidence and not reinterpret raw numeric values.
+  v2.2.0 — Rule 2: Added VERDICT / RISK CONFLICT HANDLING section with
+           explicit instructions for cases where the detector verdict is
+           REAL IMAGE but the forensic risk level is HIGH or CRITICAL.
+  v2.2.0 — Rule 3: Strengthened Absolute Rule #1 with explicit "must never
+           override" language and added a dedicated DETECTOR AUTHORITY
+           clarification section. Also applied all three rules consistently
+           across DETAILED, SUMMARY, and JSON system prompts.
 """
 
 from __future__ import annotations
@@ -45,7 +54,7 @@ from forensic_signals import (
 # Prompt Versioning (for audit trails)
 # ──────────────────────────────────────────────────────
 
-PROMPT_VERSION = "2.1.0"
+PROMPT_VERSION = "2.2.0"
 PROMPT_SCHEMA = "forensic-reasoning-v2"
 
 
@@ -68,7 +77,7 @@ VALID_PRIMARY_EVIDENCE = {
     "spectral_analysis",
     "compression_analysis",
     "sensor_fingerprint",
-    "multiple_signals",       # Issue 3: tie handling
+    "multiple_signals",          # Issue 3: tie handling
 }
 
 
@@ -89,7 +98,7 @@ class SignalAgreement:
     prnu_vote: str              # "AI" | "REAL" | "INCONCLUSIVE"
     agreement_status: str       # "UNANIMOUS" | "MAJORITY" | "SPLIT" | "INCONCLUSIVE"
     agreeing_count: int         # Number of modalities agreeing with verdict
-    dissenting_signals: List[str]   # Names of signals that disagree
+    dissenting_signals: List[str]  # Names of signals that disagree
     narrative_hint: str         # One-line context for LLM
 
 
@@ -98,9 +107,9 @@ def compute_signal_agreement(signals: ForensicSignals) -> SignalAgreement:
     Analyze whether the three forensic modalities corroborate each other.
 
     Thresholds for per-modality voting:
-      - Spectral:  anomaly_score ≥ 0.5 → votes AI
-      - ELA:       splicing_indicator ≥ 0.4 → votes AI
-      - PRNU:      strength_score ≤ 0.3 → votes AI (absent fingerprint)
+      - Spectral: anomaly_score ≥ 0.5 → votes AI
+      - ELA: splicing_indicator ≥ 0.4 → votes AI
+      - PRNU: strength_score ≤ 0.3  → votes AI (absent fingerprint)
 
     Inconclusive zone: values within ±0.1 of threshold.
 
@@ -126,7 +135,9 @@ def compute_signal_agreement(signals: ForensicSignals) -> SignalAgreement:
     prnu_vote = _vote(prnu.strength_score, 0.3, invert=True)
 
     votes = [spectral_vote, ela_vote, prnu_vote]
-    vote_names = ["spectral_analysis", "compression_analysis", "sensor_fingerprint"]
+    vote_names = [
+        "spectral_analysis", "compression_analysis", "sensor_fingerprint"
+    ]
 
     # ── Agreement analysis ──
     is_ai_verdict = signals.verdict == "AI GENERATED"
@@ -150,11 +161,17 @@ def compute_signal_agreement(signals: ForensicSignals) -> SignalAgreement:
 
     if len(definitive_votes) == 0:
         status = "INCONCLUSIVE"
-        hint = "All three modalities fall in ambiguous ranges — low interpretive certainty."
+        hint = (
+            "All three modalities fall in ambiguous ranges — "
+            "low interpretive certainty."
+        )
     elif all(v == definitive_votes[0] for v in definitive_votes):
         if len(definitive_votes) == 3:
             status = "UNANIMOUS"
-            hint = "All three forensic modalities independently corroborate the verdict."
+            hint = (
+                "All three forensic modalities independently "
+                "corroborate the verdict."
+            )
         else:
             status = "MAJORITY"
             hint = (
@@ -186,7 +203,7 @@ def compute_signal_agreement(signals: ForensicSignals) -> SignalAgreement:
 
 
 # ══════════════════════════════════════════════════════
-#  SYSTEM PROMPTS
+# SYSTEM PROMPTS
 # ══════════════════════════════════════════════════════
 
 # ── Detailed Report System Prompt ────────────────────
@@ -199,7 +216,7 @@ evidence in fraud investigations and legal proceedings.
 Prompt schema: {PROMPT_SCHEMA} | Version: {PROMPT_VERSION}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- ROLE AND AUTHORITY
+  ROLE AND AUTHORITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 You receive structured forensic signal data from a multi-modal AI image \
@@ -208,14 +225,73 @@ is strictly to INTERPRET and EXPLAIN the detector's findings. You are an \
 analyst, not a classifier.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- ABSOLUTE RULES (VIOLATION = REPORT REJECTION)
+  DETECTOR AUTHORITY (v2.2.0)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. NEVER override, contradict, or re-interpret the detector's verdict.
-   The verdict and probability are GROUND TRUTH from the neural network.
-2. NEVER fabricate, invent, or hallucinate metric values.
-   You may ONLY reference metrics explicitly provided in the data payload.
-3. NEVER speculate about image content, identity, location, or context.
+The LLM must NEVER override the detector verdict. The detector's verdict \
+and probability are the authoritative classification output from a trained \
+neural network. The role of the LLM is exclusively to explain the detector \
+decision using the provided forensic signals. You may note uncertainty, flag \
+conflicting evidence, or recommend further review — but you must NEVER \
+substitute your own classification judgment for the detector's output.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SIGNAL INTERPRETATION AUTHORITY (v2.2.0)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The forensic signal interpretations provided in the context (under the \
+heading "FORENSIC SIGNAL INTERPRETATION") summarize the detector's \
+numerical metrics into human-readable descriptions. These interpreted \
+signals should be treated as the PRIMARY EVIDENCE when explaining the \
+detector decision.
+
+Rules for signal interpretation:
+1. Use the provided natural-language signal descriptions as the basis \
+   for your forensic narrative. They have been computed deterministically \
+   from calibrated thresholds.
+2. Do NOT attempt to independently reinterpret the raw numeric values \
+   (anomaly scores, splicing indicators, strength scores, etc.) using \
+   your own thresholds or heuristics. The signal translation layer has \
+   already applied the correct forensic thresholds.
+3. You MAY reference specific raw metric values to support the \
+   pre-interpreted signal descriptions (e.g., "The spectral anomaly \
+   score of 0.82 confirms the strong spectral irregularity noted above").
+4. If the interpreted signals and the raw metrics appear to contradict \
+   each other, ALWAYS defer to the interpreted signals.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VERDICT / RISK CONFLICT HANDLING (v2.2.0)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In some cases the detector verdict may be REAL IMAGE (probability below \
+threshold) while the forensic risk level is HIGH or CRITICAL. This is a \
+legitimate disagreement between the model's classification confidence and \
+the forensic signal evidence. Handle this as follows:
+
+1. Acknowledge that the classification probability was below the decision \
+   threshold, resulting in a REAL IMAGE verdict.
+2. Clearly state that despite the below-threshold probability, the forensic \
+   signals indicate elevated manipulation risk.
+3. Explain which specific forensic signals are driving the high risk \
+   assessment (spectral anomalies, absent PRNU, compression inconsistencies).
+4. Recommend that the image be treated with caution and flagged for \
+   further manual expert review.
+5. Do NOT present the image as definitively clean or safe — the elevated \
+   forensic risk overrides casual interpretation of the REAL verdict.
+
+If a WARNING block is present in the context, incorporate its message \
+into your report narrative.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ABSOLUTE RULES (VIOLATION = REPORT REJECTION)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. NEVER override, contradict, or re-classify the detector's verdict. \
+   The verdict and probability are GROUND TRUTH from the neural network. \
+   Your role is to EXPLAIN, not to judge.
+2. NEVER fabricate, invent, or hallucinate metric values. You may ONLY \
+   reference metrics explicitly provided in the data payload.
+3. NEVER speculate about image content, identity, location, or context. \
    You analyze SIGNALS, not semantics.
 4. NEVER use hedging language that undermines the detector when confidence \
    is HIGH. State findings directly.
@@ -224,15 +300,18 @@ analyst, not a classifier.
 6. NEVER add preamble, sign-off, apology, or commentary outside the \
    report template.
 7. Every interpretive statement MUST be traceable to a specific metric \
-   in the provided data.
+   in the provided data OR to a pre-interpreted signal description.
+8. Treat the pre-interpreted signal descriptions as primary evidence. \
+   Do not independently reinterpret raw numeric thresholds.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- FORENSIC DOMAIN KNOWLEDGE
+  FORENSIC DOMAIN KNOWLEDGE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 You must apply the following domain knowledge when interpreting metrics:
 
 ## Spectral Analysis (Fourier Domain)
+
 The system divides the image into 16×16 patches, sorted into "rich texture" \
 (edges, grass, complex structures) and "poor texture" (sky, walls, smooth \
 surfaces) groups. Each patch undergoes 2D FFT → azimuthal integration to \
@@ -255,6 +334,7 @@ Key interpretive rules:
   or low ratios can indicate unnatural texture distribution.
 
 ## Error Level Analysis (ELA)
+
 ELA re-saves the image at a fixed JPEG quality and measures the pixel-level \
 difference. Regions that have been edited, spliced, or generated differently \
 will show inconsistent error levels compared to the rest of the image.
@@ -272,6 +352,7 @@ Key interpretive rules:
   Very low entropy suggests artificial uniformity.
 
 ## Sensor Noise Fingerprint (PRNU)
+
 Physical camera sensors imprint a unique Photo Response Non-Uniformity \
 (PRNU) pattern — a consistent high-frequency noise signature caused by \
 manufacturing variations in sensor pixels. This acts as a "fingerprint" \
@@ -291,32 +372,35 @@ Key interpretive rules:
   camera origin, BUT does not rule out post-capture manipulation.
 
 ## Signal Agreement
+
 When modalities agree, findings are more reliable. When they disagree, \
 the report MUST acknowledge the conflict and recommend caution.
 
 ## Primary Evidence
+
 When the primary evidence is listed as "multiple_signals", it means two \
 or more forensic modalities produced equally strong suspicion scores. \
 In this case, do not single out one modality — describe the combined \
 evidence pattern instead.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- OUTPUT TEMPLATE (EXACT FORMAT REQUIRED)
+  OUTPUT TEMPLATE (EXACT FORMAT REQUIRED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Respond ONLY with the following template, filled in based on the data:
-VERDICT: (% probability)
+
+VERDICT: <verdict> (<probability>% probability)
 
 EVIDENCE SUMMARY
 
 • Spectral Analysis:
-<2–3 sentences interpreting spectral metrics. Reference specific numbers.>
+  <2–3 sentences interpreting spectral metrics. Reference specific numbers.>
 
 • Compression Analysis (ELA):
-<2–3 sentences interpreting ELA metrics. Reference specific numbers.>
+  <2–3 sentences interpreting ELA metrics. Reference specific numbers.>
 
 • Sensor Fingerprint (PRNU):
-<2–3 sentences interpreting PRNU metrics. Reference specific numbers.>
+  <2–3 sentences interpreting PRNU metrics. Reference specific numbers.>
 
 SIGNAL AGREEMENT: <agreement_status>
 <1–2 sentences on whether modalities corroborate. Note any dissenting signals.>
@@ -328,17 +412,15 @@ CONFIDENCE: <confidence_level>
 <1 sentence explaining what drives confidence up or down.>
 
 PRIMARY EVIDENCE: <primary_evidence_modality>
-<1 sentence identifying which signal was most decisive and why.
+<1 sentence identifying which signal was most decisive and why. \
 If "multiple_signals", describe the combined evidence pattern.>
 
 RECOMMENDATION:
-<2–3 actionable sentences for the insurance fraud investigator.
+<2–3 actionable sentences for the insurance fraud investigator. \
 Include specific next steps based on the risk level and evidence pattern.>
 
-text
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- EDGE CASE HANDLING
+  EDGE CASE HANDLING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - If probability is between 0.45 and 0.55: explicitly state the model \
@@ -353,8 +435,11 @@ text
   localized editing on an otherwise authentic image.
 - If primary evidence is "multiple_signals": describe the converging \
   evidence from all tied modalities rather than picking one.
+- If verdict is REAL IMAGE but risk is HIGH or CRITICAL: follow the \
+  VERDICT / RISK CONFLICT HANDLING rules above. Do NOT present the \
+  image as definitively authentic. Emphasize the forensic risk and \
+  recommend further review.
 """
-
 
 # ── Summary Report System Prompt ─────────────────────
 
@@ -365,13 +450,26 @@ for insurance claim triage.
 Prompt schema: {PROMPT_SCHEMA} | Version: {PROMPT_VERSION}
 
 RULES:
-1. Never override the detector's verdict or probability.
+1. Never override the detector's verdict or probability. The LLM must \
+   never substitute its own classification for the detector's output. \
+   Your role is to explain, not to re-classify.
 2. Never fabricate metrics — only reference provided data.
 3. Keep the entire response under 150 words.
-4. If primary evidence is "multiple_signals", mention all contributing modalities.
+4. If primary evidence is "multiple_signals", mention all contributing \
+   modalities.
+5. Treat the pre-interpreted forensic signal descriptions (provided in \
+   the context under "FORENSIC SIGNAL INTERPRETATION") as your primary \
+   evidence. Do not independently reinterpret raw numeric values using \
+   your own thresholds.
+6. If the verdict is REAL IMAGE but the risk level is HIGH or CRITICAL, \
+   state that the probability was below the threshold but forensic \
+   signals indicate elevated manipulation risk requiring further review. \
+   Do NOT present the image as definitively clean.
+7. If a WARNING block is present in the context, incorporate its message.
 
 OUTPUT FORMAT (exact):
-VERDICT: (% probability)
+
+VERDICT: <verdict> (<probability>% probability)
 RISK: <risk_level> | CONFIDENCE: <confidence_level>
 
 KEY FINDINGS:
@@ -380,10 +478,7 @@ KEY FINDINGS:
 • <Signal agreement status — 1 sentence>
 
 ACTION: <1 sentence recommendation>
-
-text
 """
-
 
 # ── Structured JSON System Prompt ────────────────────
 
@@ -394,18 +489,33 @@ forensic report from the provided signal data.
 Prompt schema: {PROMPT_SCHEMA} | Version: {PROMPT_VERSION}
 
 RULES:
-1. Never override the detector's verdict.
+1. Never override the detector's verdict. The LLM must never substitute \
+   its own classification. Your role is to interpret and explain the \
+   detector output using the provided forensic signals.
 2. Never fabricate metrics.
 3. Output ONLY valid JSON — no markdown fences, no commentary.
-4. If primary_evidence is "multiple_signals", list all tied modalities in the \
-   "primary_evidence" field as a comma-separated string.
+4. If primary_evidence is "multiple_signals", list all tied modalities \
+   in the "primary_evidence" field as a comma-separated string.
+5. Treat the pre-interpreted forensic signal descriptions (provided in \
+   the context under "FORENSIC SIGNAL INTERPRETATION") as your primary \
+   source for the "interpretation" fields. Do not independently \
+   reinterpret raw numeric values using your own thresholds.
+6. If the verdict is "REAL IMAGE" but risk_level is "HIGH" or "CRITICAL", \
+   set "verdict_risk_conflict" to true and include a "conflict_note" \
+   field explaining that forensic signals indicate elevated risk despite \
+   the below-threshold probability.
+7. If a WARNING block is present in the context, reflect its content \
+   in the "conflict_note" field.
 
 JSON SCHEMA:
+
 {{
   "verdict": "<string>",
   "probability_pct": <float>,
   "risk_level": "<string>",
   "confidence_level": "<string>",
+  "verdict_risk_conflict": <boolean>,
+  "conflict_note": "<string or null>",
   "evidence": {{
     "spectral": {{
       "interpretation": "<string: 1-2 sentences>",
@@ -429,7 +539,6 @@ JSON SCHEMA:
 }}
 """
 
-
 # Prompt registry for format selection
 _SYSTEM_PROMPTS: Dict[ReportFormat, str] = {
     ReportFormat.DETAILED: SYSTEM_PROMPT_DETAILED,
@@ -439,7 +548,7 @@ _SYSTEM_PROMPTS: Dict[ReportFormat, str] = {
 
 
 # ══════════════════════════════════════════════════════
-#  USER PROMPT BUILDER
+# USER PROMPT BUILDER
 # ══════════════════════════════════════════════════════
 
 def build_user_prompt(
@@ -452,14 +561,20 @@ def build_user_prompt(
     Build the user-turn prompt containing all forensic signal data.
 
     This prompt is DETERMINISTIC: same ForensicSignals → same prompt.
+
     All metrics are presented as raw data without interpretation,
-    leaving reasoning entirely to the LLM.
+    leaving reasoning entirely to the LLM. The pre-interpreted signal
+    descriptions (from translate_signals_to_text) are injected via the
+    additional_context parameter by the forensic agent's
+    _build_signal_context() method.
 
     Args:
         signals:            Complete forensic signal package from detector.
         report_format:      Desired output format (affects instruction phrasing).
         case_id:            Optional insurance claim identifier for traceability.
-        additional_context: Optional investigator notes (appended verbatim).
+        additional_context: Optional text appended verbatim. In the standard
+                            pipeline this contains the FORENSIC SIGNAL
+                            INTERPRETATION block built by the agent.
 
     Returns:
         Formatted user prompt string.
@@ -485,83 +600,88 @@ def build_user_prompt(
     # ── Detector Output ──
     sections.append(_section(
         "DETECTOR OUTPUT",
-        f"Verdict           : {signals.verdict}",
-        f"Probability (AI)  : {signals.probability * 100:.1f}%",
-        f"Raw Logit         : {signals.raw_logit}",
-        f"Threshold Used    : {signals.threshold}",
+        f"Verdict              : {signals.verdict}",
+        f"Probability (AI)     : {signals.probability * 100:.1f}%",
+        f"Raw Logit            : {signals.raw_logit}",
+        f"Threshold Used       : {signals.threshold}",
     ))
 
     # ── Spectral Analysis ──
     sections.append(_section(
         "SPECTRAL ANALYSIS (Fourier Domain)",
-        f"Rich Patch Mean Energy         : {sp.rich_mean_energy}",
-        f"Poor Patch Mean Energy         : {sp.poor_mean_energy}",
-        f"Rich/Poor Energy Ratio         : {sp.rich_poor_energy_ratio}",
-        f"Rich High-Frequency Ratio      : {sp.rich_high_freq_ratio}  "
+        f"Rich Patch Mean Energy       : {sp.rich_mean_energy}",
+        f"Poor Patch Mean Energy       : {sp.poor_mean_energy}",
+        f"Rich/Poor Energy Ratio       : {sp.rich_poor_energy_ratio}",
+        f"Rich High-Frequency Ratio    : {sp.rich_high_freq_ratio} "
         f"[0.0=no HF, 1.0=all HF]",
-        f"Poor High-Frequency Ratio      : {sp.poor_high_freq_ratio}  "
+        f"Poor High-Frequency Ratio    : {sp.poor_high_freq_ratio} "
         f"[0.0=no HF, 1.0=all HF]",
-        f"Rich Spectral Diversity (std)  : {sp.rich_spectral_diversity}  "
+        f"Rich Spectral Diversity (std): {sp.rich_spectral_diversity} "
         f"[higher=more natural variation]",
-        f"Poor Spectral Diversity (std)  : {sp.poor_spectral_diversity}  "
+        f"Poor Spectral Diversity (std): {sp.poor_spectral_diversity} "
         f"[higher=more natural variation]",
-        f"Spectral Anomaly Score         : {sp.anomaly_score}  "
+        f"Spectral Anomaly Score       : {sp.anomaly_score} "
         f"[0.0=normal, 1.0=highly anomalous]",
     ))
 
     # ── ELA ──
     sections.append(_section(
         "ERROR LEVEL ANALYSIS (ELA)",
-        f"Mean Intensity       : {ela.mean_intensity}  "
+        f"Mean Intensity       : {ela.mean_intensity} "
         f"[average compression error level]",
-        f"Std Intensity        : {ela.std_intensity}  "
+        f"Std Intensity        : {ela.std_intensity} "
         f"[spread of error levels]",
-        f"Max Intensity        : {ela.max_intensity}  "
+        f"Max Intensity        : {ela.max_intensity} "
         f"[peak error level]",
-        f"Uniformity Score     : {ela.uniformity_score}  "
+        f"Uniformity Score     : {ela.uniformity_score} "
         f"[0.0=highly varied, 1.0=perfectly uniform]",
-        f"Spatial Entropy      : {ela.spatial_entropy}  "
+        f"Spatial Entropy      : {ela.spatial_entropy} "
         f"[complexity of error distribution]",
-        f"Splicing Indicator   : {ela.splicing_indicator}  "
+        f"Splicing Indicator   : {ela.splicing_indicator} "
         f"[0.0=no splice evidence, 1.0=strong splice evidence]",
     ))
 
     # ── PRNU ──
     sections.append(_section(
         "SENSOR NOISE FINGERPRINT (PRNU)",
-        f"PRNU Energy            : {prnu.energy}  "
+        f"PRNU Energy          : {prnu.energy} "
         f"[mean squared noise intensity]",
-        f"PRNU Spatial Std Dev   : {prnu.spatial_std}  "
+        f"PRNU Spatial Std Dev : {prnu.spatial_std} "
         f"[noise spatial variation]",
-        f"Spectral Flatness      : {prnu.spectral_flatness}  "
+        f"Spectral Flatness    : {prnu.spectral_flatness} "
         f"[1.0=white noise/AI-like, 0.0=structured/camera-like]",
-        f"PRNU Strength Score    : {prnu.strength_score}  "
+        f"PRNU Strength Score  : {prnu.strength_score} "
         f"[0.0=absent, 1.0=strong camera signature]",
-        f"Camera Consistency     : {prnu.camera_consistency}  "
+        f"Camera Consistency   : {prnu.camera_consistency} "
         f"[consistent|weak|absent]",
     ))
 
     # ── Signal Agreement (pre-computed) ──
     sections.append(_section(
         "SIGNAL AGREEMENT ANALYSIS (pre-computed)",
-        f"Spectral Vote       : {agreement.spectral_vote}",
-        f"ELA Vote            : {agreement.ela_vote}",
-        f"PRNU Vote           : {agreement.prnu_vote}",
-        f"Agreement Status    : {agreement.agreement_status}",
-        f"Agreeing Modalities : {agreement.agreeing_count} / 3",
-        f"Dissenting Signals  : {', '.join(agreement.dissenting_signals) or 'None'}",
-        f"Summary             : {agreement.narrative_hint}",
+        f"Spectral Vote        : {agreement.spectral_vote}",
+        f"ELA Vote             : {agreement.ela_vote}",
+        f"PRNU Vote            : {agreement.prnu_vote}",
+        f"Agreement Status     : {agreement.agreement_status}",
+        f"Agreeing Modalities  : {agreement.agreeing_count} / 3",
+        f"Dissenting Signals   : "
+        f"{', '.join(agreement.dissenting_signals) or 'None'}",
+        f"Summary              : {agreement.narrative_hint}",
     ))
 
     # ── Derived Assessments ──
     sections.append(_section(
         "DERIVED ASSESSMENTS",
-        f"Risk Level          : {signals.risk_level}",
-        f"Confidence Level    : {signals.confidence_level}",
-        f"Primary Evidence    : {signals.primary_evidence}",
+        f"Risk Level           : {signals.risk_level}",
+        f"Confidence Level     : {signals.confidence_level}",
+        f"Primary Evidence     : {signals.primary_evidence}",
     ))
 
     # ── Additional Context (if any) ──
+    # In the standard pipeline, this contains the FORENSIC SIGNAL
+    # INTERPRETATION block built by ForensicAgent._build_signal_context(),
+    # which includes pre-interpreted signal descriptions, probability
+    # grounding, and risk-override warnings.
     if additional_context:
         sections.append(_section(
             "INVESTIGATOR NOTES",
@@ -572,26 +692,31 @@ def build_user_prompt(
     format_instructions = {
         ReportFormat.DETAILED: (
             "Produce your DETAILED forensic report now, following the "
-            "exact template from your instructions. Reference specific "
-            "metric values to support every interpretive statement."
+            "exact template from your instructions. Use the FORENSIC "
+            "SIGNAL INTERPRETATION descriptions as your primary evidence "
+            "source. Reference specific metric values to support every "
+            "interpretive statement."
         ),
         ReportFormat.SUMMARY: (
             "Produce your BRIEF summary report now, under 150 words, "
-            "following the exact template from your instructions."
+            "following the exact template from your instructions. Base "
+            "your findings on the FORENSIC SIGNAL INTERPRETATION "
+            "descriptions provided in the context."
         ),
         ReportFormat.STRUCTURED_JSON: (
             "Produce the JSON forensic report now. Output ONLY valid JSON, "
-            "no markdown fences or surrounding text."
+            "no markdown fences or surrounding text. Use the FORENSIC "
+            "SIGNAL INTERPRETATION descriptions for the interpretation "
+            "fields."
         ),
     }
-
     sections.append(format_instructions[report_format])
 
     return "\n\n".join(sections)
 
 
 # ══════════════════════════════════════════════════════
-#  PUBLIC API
+# PUBLIC API
 # ══════════════════════════════════════════════════════
 
 def get_system_prompt(
@@ -618,14 +743,16 @@ def build_prompt_pair(
     """
     Build both system and user prompts as a ready-to-use dict.
 
-    Convenience method for the forensic agent to construct the
-    complete message payload in one call.
+    Convenience method for the forensic agent to construct the complete
+    message payload in one call.
 
     Args:
         signals:            ForensicSignals from the detector pipeline.
         report_format:      Desired output format.
         case_id:            Optional case identifier.
-        additional_context: Optional investigator notes.
+        additional_context: Optional text appended to user prompt. In the
+                            standard pipeline this is the FORENSIC SIGNAL
+                            INTERPRETATION block from _build_signal_context().
 
     Returns:
         Dict with keys 'system' and 'user' containing prompt strings.
@@ -663,7 +790,7 @@ def get_prompt_metadata() -> Dict[str, str]:
 
 
 # ══════════════════════════════════════════════════════
-#  INTERNAL HELPERS
+# INTERNAL HELPERS
 # ══════════════════════════════════════════════════════
 
 def _section(title: str, *lines: str) -> str:
@@ -682,7 +809,7 @@ def _section(title: str, *lines: str) -> str:
 
 
 # ══════════════════════════════════════════════════════
-#  PROMPT VALIDATION UTILITY
+# PROMPT VALIDATION UTILITY
 # ══════════════════════════════════════════════════════
 
 def validate_prompt_completeness(signals: ForensicSignals) -> List[str]:
@@ -690,14 +817,16 @@ def validate_prompt_completeness(signals: ForensicSignals) -> List[str]:
     Check that all required fields in ForensicSignals are populated
     before building a prompt. Returns a list of warnings (empty = OK).
 
-    This is a safety net to catch upstream extraction failures
-    before they reach the LLM and produce garbage reports.
+    This is a safety net to catch upstream extraction failures before
+    they reach the LLM and produce garbage reports.
     """
     warnings: List[str] = []
 
     # ── Detector output checks ──
     if signals.probability is None:
-        warnings.append("CRITICAL: probability is None — detector may have failed.")
+        warnings.append(
+            "CRITICAL: probability is None — detector may have failed."
+        )
     if signals.verdict not in ("AI GENERATED", "REAL IMAGE"):
         warnings.append(
             f"WARNING: unexpected verdict value '{signals.verdict}'."
@@ -710,11 +839,13 @@ def validate_prompt_completeness(signals: ForensicSignals) -> List[str]:
     else:
         if not (0.0 <= sp.anomaly_score <= 1.0):
             warnings.append(
-                f"WARNING: spectral anomaly_score out of range: {sp.anomaly_score}"
+                f"WARNING: spectral anomaly_score out of range: "
+                f"{sp.anomaly_score}"
             )
         if sp.rich_mean_energy <= 0:
             warnings.append(
-                "WARNING: rich_mean_energy is zero/negative — possible extraction failure."
+                "WARNING: rich_mean_energy is zero/negative — "
+                "possible extraction failure."
             )
 
     # ── ELA checks ──
@@ -724,11 +855,13 @@ def validate_prompt_completeness(signals: ForensicSignals) -> List[str]:
     else:
         if not (0.0 <= ela.uniformity_score <= 1.0):
             warnings.append(
-                f"WARNING: ELA uniformity_score out of range: {ela.uniformity_score}"
+                f"WARNING: ELA uniformity_score out of range: "
+                f"{ela.uniformity_score}"
             )
         if not (0.0 <= ela.splicing_indicator <= 1.0):
             warnings.append(
-                f"WARNING: ELA splicing_indicator out of range: {ela.splicing_indicator}"
+                f"WARNING: ELA splicing_indicator out of range: "
+                f"{ela.splicing_indicator}"
             )
 
     # ── PRNU checks ──
@@ -736,13 +869,17 @@ def validate_prompt_completeness(signals: ForensicSignals) -> List[str]:
     if prnu is None:
         warnings.append("CRITICAL: PRNU metrics missing entirely.")
     else:
-        if prnu.camera_consistency not in ("consistent", "weak", "absent"):
+        if prnu.camera_consistency not in (
+            "consistent", "weak", "absent"
+        ):
             warnings.append(
-                f"WARNING: unexpected camera_consistency: '{prnu.camera_consistency}'"
+                f"WARNING: unexpected camera_consistency: "
+                f"'{prnu.camera_consistency}'"
             )
         if not (0.0 <= prnu.strength_score <= 1.0):
             warnings.append(
-                f"WARNING: PRNU strength_score out of range: {prnu.strength_score}"
+                f"WARNING: PRNU strength_score out of range: "
+                f"{prnu.strength_score}"
             )
 
     # ── Derived assessment checks ──
@@ -752,29 +889,47 @@ def validate_prompt_completeness(signals: ForensicSignals) -> List[str]:
         )
     if signals.confidence_level not in ("LOW", "MEDIUM", "HIGH"):
         warnings.append(
-            f"WARNING: unexpected confidence_level: '{signals.confidence_level}'"
+            f"WARNING: unexpected confidence_level: "
+            f"'{signals.confidence_level}'"
         )
 
-    # ────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
     # Updated for Issue 3: validate "multiple_signals" as valid value
-    # ────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
     if signals.primary_evidence not in VALID_PRIMARY_EVIDENCE:
         warnings.append(
-            f"WARNING: unexpected primary_evidence: '{signals.primary_evidence}'. "
+            f"WARNING: unexpected primary_evidence: "
+            f"'{signals.primary_evidence}'. "
             f"Valid values: {VALID_PRIMARY_EVIDENCE}"
         )
-    # ────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────
+    # v2.2.0: Warn when verdict/risk disagree — informational,
+    # not a validation failure, but useful for audit logs.
+    # ──────────────────────────────────────────────
+    if (
+        signals.risk_level in ("HIGH", "CRITICAL")
+        and signals.verdict == "REAL IMAGE"
+    ):
+        warnings.append(
+            f"INFO: Verdict/risk conflict detected — verdict is "
+            f"REAL IMAGE but risk_level is {signals.risk_level}. "
+            f"The signal context includes a WARNING block for the LLM."
+        )
+    # ──────────────────────────────────────────────
 
     return warnings
 
 
 # ══════════════════════════════════════════════════════
-#  MODULE SELF-TEST
+# MODULE SELF-TEST
 # ══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     """
     Self-test: build prompts from synthetic signals and print them.
+
     Run with: python reasoning_prompt.py
     """
 
@@ -850,12 +1005,49 @@ if __name__ == "__main__":
         primary_evidence="multiple_signals",
     )
 
+    # ── Test 3: Verdict/risk conflict case (v2.2.0) ──
+    test_signals_conflict = ForensicSignals(
+        raw_logit=-0.36,
+        probability=0.4100,
+        verdict="REAL IMAGE",
+        threshold=0.7,
+        spectral=SpectralMetrics(
+            rich_mean_energy=16.0,
+            poor_mean_energy=11.0,
+            rich_high_freq_ratio=0.18,
+            poor_high_freq_ratio=0.15,
+            rich_poor_energy_ratio=1.45,
+            rich_spectral_diversity=0.12,
+            poor_spectral_diversity=0.10,
+            anomaly_score=0.82,
+        ),
+        ela=ELAMetrics(
+            mean_intensity=0.20,
+            std_intensity=0.12,
+            max_intensity=0.85,
+            uniformity_score=0.55,
+            spatial_entropy=3.5,
+            splicing_indicator=0.55,
+        ),
+        prnu=PRNUMetrics(
+            energy=0.0008,
+            spatial_std=0.02,
+            spectral_flatness=0.92,
+            strength_score=0.10,
+            camera_consistency="absent",
+        ),
+        risk_level="HIGH",
+        confidence_level="LOW",
+        primary_evidence="spectral_analysis",
+    )
+
     for label, signals in [
         ("STANDARD", test_signals),
         ("TIED (multiple_signals)", test_signals_tied),
+        ("VERDICT/RISK CONFLICT", test_signals_conflict),
     ]:
         print(f"\n{'#' * 70}")
-        print(f" TEST CASE: {label}")
+        print(f"  TEST CASE: {label}")
         print(f"{'#' * 70}")
 
         # Validate
@@ -863,7 +1055,7 @@ if __name__ == "__main__":
         if warnings:
             print("⚠️  Validation warnings:")
             for w in warnings:
-                print(f"   {w}")
+                print(f"    {w}")
         else:
             print("✅ All validation checks passed.")
 
@@ -878,7 +1070,7 @@ if __name__ == "__main__":
         # Build and display prompts for each format
         for fmt in ReportFormat:
             print(f"\n{'=' * 60}")
-            print(f" FORMAT: {fmt.value.upper()}")
+            print(f"  FORMAT: {fmt.value.upper()}")
             print(f"{'=' * 60}")
 
             prompts = build_prompt_pair(
@@ -887,16 +1079,20 @@ if __name__ == "__main__":
                 case_id="INS-2024-00451",
             )
 
-            print(f"\n--- SYSTEM PROMPT ({len(prompts['system'])} chars) ---")
+            print(
+                f"\n--- SYSTEM PROMPT ({len(prompts['system'])} chars) ---"
+            )
             # Print first 500 chars to avoid flooding terminal
             print(prompts["system"][:500] + "...\n")
 
-            print(f"--- USER PROMPT ({len(prompts['user'])} chars) ---")
+            print(
+                f"--- USER PROMPT ({len(prompts['user'])} chars) ---"
+            )
             print(prompts["user"])
 
     # Show metadata
     print(f"\n{'=' * 60}")
-    print(" PROMPT METADATA")
+    print("  PROMPT METADATA")
     print(f"{'=' * 60}")
     meta = get_prompt_metadata()
     for k, v in meta.items():
