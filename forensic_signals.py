@@ -1,6 +1,4 @@
 """
-forensic_signals.py
-
 Forensic Signal Extraction and Quantification Module.
 
 Computes human-interpretable metrics from raw feature extraction outputs
@@ -27,11 +25,23 @@ Changelog:
   v1.1 — Issue 3: Tie handling in _primary_evidence() → returns "multiple_signals"
   v1.1 — Issue 4: Added fftshift before PRNU power spectrum computation
   v1.1 — Issue 5: Zero-peak safety in ELA normalization
+  v1.2 — Added translate_signals_to_text() signal interpretation layer
+         Converts numeric forensic metrics into human-readable natural-language
+         signals for reliable LLM reasoning. Pipeline becomes:
+             metrics → human-readable signals → LLM
+         This eliminates LLM hallucination over raw numeric thresholds.
+  v1.3 — Fix 1: Verdict signal now detects contradiction between verdict (REAL)
+         and risk level (HIGH/CRITICAL), emitting a cautionary note instead of
+         a flat "REAL" statement that would confuse the LLM.
+  v1.3 — Fix 2: Spectral interpretation now also triggers on very low
+         rich_spectral_diversity (< 0.15), catching diffusion-model images
+         whose anomaly_score may be moderate but whose patch-level spectral
+         homogeneity is a strong synthetic indicator.
 """
 
 import numpy as np
 from dataclasses import dataclass, asdict
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from scipy.stats import entropy as scipy_entropy
 from scipy.ndimage import uniform_filter
 
@@ -103,6 +113,222 @@ class ForensicSignals:
         """Serialize entire signal package to nested dict for JSON export."""
         return asdict(self)
 
+    def to_text_signals(self) -> Dict[str, str]:
+        """
+        Convenience method: produce human-readable signal descriptions
+        from this ForensicSignals instance.
+
+        Delegates to the module-level translate_signals_to_text().
+        """
+        return translate_signals_to_text(self)
+
+
+# ──────────────────────────────────────────────────────
+# Signal Translation Layer  (v1.2, updated v1.3)
+# ──────────────────────────────────────────────────────
+# Converts numeric forensic metrics into natural-language descriptions
+# so the downstream LLM receives pre-interpreted evidence rather than
+# raw floats it may hallucinate about.
+#
+# Pipeline change:
+#   OLD:  metrics ──────────────────► LLM
+#   NEW:  metrics ► human-readable signals ► LLM
+# ──────────────────────────────────────────────────────
+
+# Threshold for spectral diversity below which patches are considered
+# suspiciously homogeneous (common in diffusion-model outputs).
+_SPECTRAL_DIVERSITY_FLOOR: float = 0.15
+
+
+def translate_signals_to_text(signals: ForensicSignals) -> Dict[str, str]:
+    """
+    Convert numeric forensic metrics into human-readable signal descriptions
+    that an LLM can reason about reliably.
+
+    Args:
+        signals: A fully populated ForensicSignals dataclass instance.
+
+    Returns:
+        Dictionary with keys:
+            spectral_signal  – natural-language interpretation of spectral analysis
+            ela_signal       – natural-language interpretation of ELA analysis
+            prnu_signal      – natural-language interpretation of PRNU analysis
+            risk_summary     – natural-language interpretation of overall risk level
+            confidence_note  – natural-language interpretation of model confidence
+            evidence_note    – natural-language description of primary evidence source
+            verdict_signal   – natural-language restatement of the detector verdict
+    """
+    sp = signals.spectral
+    ela = signals.ela
+    prnu = signals.prnu
+
+    # ── Spectral Interpretation ──────────────────────
+    # ────────────────────────────────────────────────────
+    # FIX v1.3 (Fix 2): Also trigger strong-anomaly interpretation when
+    # rich_spectral_diversity is extremely low, even if anomaly_score
+    # alone is moderate. Diffusion models often produce spectrally
+    # homogeneous patches that compress the diversity metric while
+    # the composite anomaly_score (which blends HF ratio at 60%) may
+    # remain below the 0.7 threshold.
+    # ────────────────────────────────────────────────────
+    strong_spectral = (
+        sp.anomaly_score >= 0.7
+        or sp.rich_spectral_diversity < _SPECTRAL_DIVERSITY_FLOOR
+    )
+
+    if strong_spectral:
+        spectral_signal = (
+            "Strong spectral anomaly typical of AI-generated imagery. "
+            "High-frequency content is attenuated and spectral diversity "
+            "across patches is unusually low."
+        )
+    elif sp.anomaly_score >= 0.4:
+        spectral_signal = (
+            "Moderate spectral irregularities in frequency patterns. "
+            "Some reduction in high-frequency energy or patch diversity "
+            "compared to typical natural photographs."
+        )
+    else:
+        spectral_signal = (
+            "Spectral profile consistent with natural photography. "
+            "High-frequency content and cross-patch diversity fall within "
+            "expected ranges for camera-captured images."
+        )
+
+    # ── ELA Interpretation ───────────────────────────
+    if ela.splicing_indicator >= 0.5:
+        ela_signal = (
+            "Strong localized compression inconsistencies suggesting editing "
+            "or synthesis. Significant variance in error levels across the "
+            "image indicates regions were processed differently."
+        )
+    elif ela.splicing_indicator >= 0.2:
+        ela_signal = (
+            "Mild compression inconsistencies detected. Some regions show "
+            "slightly different error levels, which may indicate light "
+            "editing or recompression."
+        )
+    else:
+        ela_signal = (
+            "Compression artifacts appear uniform across the image. "
+            "Error levels are consistent, suggesting a single compression "
+            "history with no obvious splicing."
+        )
+
+    # ── PRNU Interpretation ──────────────────────────
+    if prnu.strength_score <= 0.3:
+        prnu_signal = (
+            "Camera sensor fingerprint is weak or absent, consistent with "
+            "synthetic images. No meaningful Photo Response Non-Uniformity "
+            "pattern was detected."
+        )
+    elif prnu.strength_score <= 0.6:
+        prnu_signal = (
+            "Partial camera noise pattern detected but not strongly "
+            "consistent. The sensor fingerprint is ambiguous — it may "
+            "indicate heavy post-processing or a low-quality sensor."
+        )
+    else:
+        prnu_signal = (
+            "Strong sensor noise fingerprint typical of physical cameras. "
+            "The PRNU pattern is structured and consistent with a real "
+            "imaging device."
+        )
+
+    # ── Risk Summary ─────────────────────────────────
+    risk_text = {
+        "LOW": (
+            "Minimal forensic risk indicators. The image shows no significant "
+            "signs of AI generation or manipulation across all analysis modalities."
+        ),
+        "MEDIUM": (
+            "Moderate forensic anomalies detected. Some indicators suggest "
+            "possible manipulation, but evidence is not conclusive."
+        ),
+        "HIGH": (
+            "Strong forensic anomalies indicating likely manipulation. "
+            "Multiple analysis channels flag suspicious characteristics."
+        ),
+        "CRITICAL": (
+            "Multiple forensic indicators strongly suggest AI generation. "
+            "Spectral, compression, and sensor analyses converge on synthetic origin."
+        ),
+    }.get(signals.risk_level, "Unknown risk level.")
+
+    # ── Confidence Note ──────────────────────────────
+    confidence_text = {
+        "HIGH": (
+            "The model is highly confident in its classification. "
+            "The probability is far from the decision boundary."
+        ),
+        "MEDIUM": (
+            "The model has moderate confidence. The probability is reasonably "
+            "separated from the decision boundary but not extreme."
+        ),
+        "LOW": (
+            "The model has low confidence. The probability is close to the "
+            "decision boundary; this result should be treated with caution."
+        ),
+    }.get(signals.confidence_level, "Unknown confidence level.")
+
+    # ── Primary Evidence Note ────────────────────────
+    evidence_labels = {
+        "spectral_analysis": "Fourier spectral analysis (frequency-domain anomalies)",
+        "compression_analysis": "Error Level Analysis (compression inconsistencies)",
+        "sensor_fingerprint": "PRNU sensor fingerprint analysis (camera noise absence)",
+        "multiple_signals": "Multiple forensic modalities contributing equally",
+    }
+    evidence_text = (
+        f"Primary evidence source: "
+        f"{evidence_labels.get(signals.primary_evidence, signals.primary_evidence)}."
+    )
+
+    # ── Verdict Signal ───────────────────────────────
+    # ────────────────────────────────────────────────────
+    # FIX v1.3 (Fix 1): Three-way verdict logic.
+    #
+    # Problem: When the model probability is below the classification
+    # threshold (verdict = REAL) but forensic risk is HIGH or CRITICAL,
+    # the old two-branch logic emitted a flat "REAL IMAGE" statement.
+    # Downstream, the LLM received contradictory signals: "REAL" verdict
+    # alongside "strong forensic anomalies" from the risk summary.
+    # This caused confused or self-contradictory reports.
+    #
+    # Fix: Insert a middle branch that acknowledges the below-threshold
+    # probability while explicitly flagging the forensic disagreement,
+    # so the LLM can produce a nuanced, non-contradictory explanation.
+    # ────────────────────────────────────────────────────
+    if signals.verdict == "AI GENERATED":
+        verdict_signal = (
+            f"The detector classifies this image as AI-GENERATED "
+            f"(AI probability {signals.probability:.1%}, "
+            f"threshold {signals.threshold:.1%})."
+        )
+    elif signals.risk_level in ("HIGH", "CRITICAL"):
+        verdict_signal = (
+            f"The detector classified the image as REAL because the AI "
+            f"probability ({signals.probability:.1%}) is below the threshold "
+            f"({signals.threshold:.1%}). However, several forensic signals "
+            f"indicate elevated risk and the result should be treated "
+            f"cautiously."
+        )
+    else:
+        verdict_signal = (
+            f"The detector classifies this image as REAL "
+            f"(AI probability {signals.probability:.1%}, "
+            f"below threshold {signals.threshold:.1%})."
+        )
+
+    return {
+        "spectral_signal": spectral_signal,
+        "ela_signal": ela_signal,
+        "prnu_signal": prnu_signal,
+        "risk_summary": risk_text,
+        "confidence_note": confidence_text,
+        "evidence_note": evidence_text,
+        "verdict_signal": verdict_signal,
+    }
+
 
 # ──────────────────────────────────────────────────────
 # Signal Extractor
@@ -132,6 +358,13 @@ class ForensicSignalExtractor:
             ela_map       = features['ela'],
             prnu_map      = features['noise'],
         )
+
+        # Get human-readable signals for LLM consumption (v1.2+)
+        text_signals = signals.to_text_signals()
+        # — or equivalently —
+        text_signals = translate_signals_to_text(signals)
+        # — or in one call —
+        signals, text_signals = extractor.extract_with_text(...)
     """
 
     # ── Calibration Constants (tune on validation data) ────
@@ -177,6 +410,27 @@ class ForensicSignalExtractor:
             confidence_level=self._confidence_level(prob),
             primary_evidence=self._primary_evidence(spectral, ela, prnu),
         )
+
+    def extract_with_text(
+        self,
+        raw_logit: float,
+        rich_spectral: np.ndarray,
+        poor_spectral: np.ndarray,
+        ela_map: np.ndarray,
+        prnu_map: np.ndarray,
+    ) -> Tuple[ForensicSignals, Dict[str, str]]:
+        """
+        Convenience method: extract metrics AND translate to text in one call.
+
+        Returns:
+            (ForensicSignals, dict[str, str]) — structured signals and
+            their human-readable text translations ready for LLM prompting.
+        """
+        signals = self.extract(
+            raw_logit, rich_spectral, poor_spectral, ela_map, prnu_map,
+        )
+        text_signals = translate_signals_to_text(signals)
+        return signals, text_signals
 
     # ── Input Validation ──────────────────────────────
 
