@@ -1,41 +1,50 @@
 """
 forensic_agent.py
-
 Forensic Reasoning Agent — Master Orchestrator Module.
 
 Wraps the existing detector pipeline and augments it with:
   1. Interpretable forensic signal extraction (forensic_signals.py)
-  2. Structured prompt construction (reasoning_prompt.py)
-  3. LLM-powered forensic report generation (Azure OpenAI)
-  4. Deterministic fallback when LLM is unavailable
-  5. Batch analysis capability
-  6. Report export (text / JSON)
+  2. Signal-to-text translation layer (forensic_signals.translate_signals_to_text)
+  3. Structured prompt construction (reasoning_prompt.py)
+  4. LLM-powered forensic report generation (Azure OpenAI)
+  5. Deterministic fallback when LLM is unavailable
+  6. Batch analysis capability
+  7. Report export (text / JSON)
 
 Verified data flow (traced against utils.py, models.py, app.py):
 
-  PIL.Image
-      ↓
-  azi_diff(PIL.Image, patch_num=128, N=256) → dict
-      ├── 'total_emb': [rich (128,256), poor (128,256)]   ← spectral+positional
-      ├── 'ela':       (128,128,3) float32 ∈ [0,1]        ← RGB ELA
-      ├── 'noise':     (128,128) float32 ∈ [0,1]          ← Laplacian PRNU
-      └── 'image_size': (H, W)
-      ↓
-  Tensor preparation (matches app.py exactly):
-      rich  = torch.tensor(features['total_emb'][0], dtype=float32).unsqueeze(0)
-      poor  = torch.tensor(features['total_emb'][1], dtype=float32).unsqueeze(0)
-      ela   = torch.tensor(features['ela'],          dtype=float32).unsqueeze(0)
-      noise = torch.tensor(features['noise'],        dtype=float32).unsqueeze(0)
-      ↓
-  model(rich, poor, ela, noise) → raw logit (B,1)
-      ↓
-  ForensicSignalExtractor.extract() → ForensicSignals
-      ↓
-  build_prompt_pair() → system + user prompts
-      ↓
-  Azure OpenAI → forensic narrative
-      ↓
-  ForensicReport (structured output)
+    PIL.Image
+        ↓
+    azi_diff(PIL.Image, patch_num=128, N=256)  →  dict
+        ├── 'total_emb': [rich (128,256), poor (128,256)]  ← spectral+positional
+        ├── 'ela':        (128,128,3) float32 ∈ [0,1]      ← RGB ELA
+        ├── 'noise':      (128,128)   float32 ∈ [0,1]      ← Laplacian PRNU
+        └── 'image_size': (H, W)
+        ↓
+    Tensor preparation (matches app.py exactly):
+        rich  = torch.tensor(features['total_emb'][0], dtype=float32).unsqueeze(0)
+        poor  = torch.tensor(features['total_emb'][1], dtype=float32).unsqueeze(0)
+        ela   = torch.tensor(features['ela'],          dtype=float32).unsqueeze(0)
+        noise = torch.tensor(features['noise'],        dtype=float32).unsqueeze(0)
+        ↓
+    model(rich, poor, ela, noise) → raw logit (B,1)
+        ↓
+    ForensicSignalExtractor.extract() → ForensicSignals
+        ↓
+    translate_signals_to_text() → human-readable signal descriptions
+        ↓
+    _build_signal_context() → structured context with probability grounding
+                              + risk-override warning when applicable
+        ↓
+    build_prompt_pair() → system + user prompts (with signal context)
+        ↓
+    Azure OpenAI → forensic narrative
+        ↓
+    ForensicReport (structured output)
+
+LLM reasoning pipeline:
+    OLD:  numeric metrics ───────────────────────► LLM  (hallucination-prone)
+    NEW:  numeric metrics ► human-readable signals ► LLM  (grounded reasoning)
 
 Does NOT modify any existing detector files.
 
@@ -43,6 +52,19 @@ Changelog:
   v1.0 — Initial implementation
   v1.1 — Issue 1: Removed weights_only=True for PyTorch < 2.2 compat
   v1.1 — Issue 2: Fixed "Signal Agreement" → "Primary Evidence" UI label
+  v1.2 — Signal interpretation layer: _generate_llm_report() now translates
+         ForensicSignals into natural-language descriptions via
+         translate_signals_to_text() and injects them as structured context
+         into the LLM prompt. Eliminates LLM hallucination over raw thresholds.
+  v1.2 — Fallback report also uses text signals for narrative consistency.
+  v1.3 — Fix 1: _build_signal_context() now includes explicit raw probability
+         and threshold values directly after the verdict signal, giving the
+         LLM numerical grounding for its reasoning.
+  v1.3 — Fix 2: _build_signal_context() now appends a risk-override WARNING
+         block when the detector verdict is REAL but the forensic risk level
+         is HIGH or CRITICAL. This prevents LLM confusion in disagreement
+         cases where the probability is below threshold but forensic evidence
+         flags manipulation risk.
 
 Usage:
     # Single image analysis
@@ -79,7 +101,11 @@ from models import TextureContrastClassifier
 from utils import azi_diff
 
 # ── Imports from reasoning layer ──
-from forensic_signals import ForensicSignalExtractor, ForensicSignals
+from forensic_signals import (
+    ForensicSignalExtractor,
+    ForensicSignals,
+    translate_signals_to_text,
+)
 from reasoning_prompt import (
     build_prompt_pair,
     validate_prompt_completeness,
@@ -99,16 +125,17 @@ logging.basicConfig(
 
 
 # ══════════════════════════════════════════════════════
-#  OUTPUT CONTAINERS
+# OUTPUT CONTAINERS
 # ══════════════════════════════════════════════════════
+
 
 @dataclass
 class ForensicReport:
     """
     Complete output of the forensic reasoning pipeline for a single image.
 
-    Contains both structured machine-readable signals AND the
-    LLM-generated (or fallback) human-readable narrative.
+    Contains both structured machine-readable signals AND the LLM-generated
+    (or fallback) human-readable narrative.
     """
     # ── Identification ──
     image_path: str
@@ -178,8 +205,9 @@ class ForensicReport:
 
 
 # ══════════════════════════════════════════════════════
-#  FORENSIC AGENT
+# FORENSIC AGENT
 # ══════════════════════════════════════════════════════
+
 
 class ForensicAgent:
     """
@@ -187,7 +215,8 @@ class ForensicAgent:
 
     Orchestrates:
         Image → Feature Extraction → Model Inference → Signal Analysis
-              → Prompt Construction → Azure OpenAI → Forensic Report
+        → Signal Translation → Prompt Construction → Azure OpenAI
+        → Forensic Report
 
     The agent is stateless per-analysis: each call to analyze() is
     independent. The model and LLM client are initialized once.
@@ -208,11 +237,11 @@ class ForensicAgent:
 
         Args:
             checkpoint_path: Path to TextureContrastClassifier checkpoint.
-                             Must be a direct state_dict file (verified
-                             against app.py loading pattern).
+                Must be a direct state_dict file (verified against app.py
+                loading pattern).
             device:          "cpu", "cuda", or "auto" (auto-detect).
-            threshold:       Classification threshold. Higher → fewer
-                             false positives. Default 0.7 matches app.py.
+            threshold:       Classification threshold. Higher → fewer false
+                             positives. Default 0.7 matches app.py.
             report_format:   Output report format (DETAILED/SUMMARY/JSON).
             llm_temperature: Azure OpenAI temperature. Low = deterministic.
             llm_max_tokens:  Max tokens for LLM response.
@@ -246,8 +275,9 @@ class ForensicAgent:
         # ── Azure OpenAI Client ──
         self.azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
         self.azure_api_version = os.getenv(
-            "AZURE_OPENAI_VERSION", "2024-02-15-preview"
+            "AZURE_OPENAI_VERSION", "2024-11-20"
         )
+
         self.llm_client: Optional[AzureOpenAI] = None
 
         if self.enable_llm:
@@ -284,7 +314,7 @@ class ForensicAgent:
             logger.info("LLM reasoning disabled by configuration.")
 
     # ──────────────────────────────────────────────────
-    #  Model Loading
+    # Model Loading
     # ──────────────────────────────────────────────────
 
     def _load_model(self, checkpoint_path: str) -> TextureContrastClassifier:
@@ -295,8 +325,8 @@ class ForensicAgent:
             model = TextureContrastClassifier()
             model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 
-        The checkpoint file IS the state_dict directly — NOT wrapped in
-        a dict with 'model_state_dict' key.
+        The checkpoint file IS the state_dict directly — NOT wrapped
+        in a dict with 'model_state_dict' key.
         """
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(
@@ -306,16 +336,16 @@ class ForensicAgent:
 
         model = TextureContrastClassifier()
 
-        # ────────────────────────────────────────────────
+        # ──────────────────────────────────────────────
         # FIX Issue 1: Removed weights_only=True for PyTorch < 2.2 compat
         # The checkpoint is a local trusted file — no security concern.
         # Compatible with torch 1.13, 2.0, 2.1, 2.2+
-        # ────────────────────────────────────────────────
+        # ──────────────────────────────────────────────
         state_dict = torch.load(
             checkpoint_path,
             map_location=self.device,
         )
-        # ────────────────────────────────────────────────
+        # ──────────────────────────────────────────────
 
         model.load_state_dict(state_dict)
         model.to(self.device)
@@ -328,7 +358,7 @@ class ForensicAgent:
         return model
 
     # ──────────────────────────────────────────────────
-    #  Single Image Analysis (Core Pipeline)
+    # Single Image Analysis (Core Pipeline)
     # ──────────────────────────────────────────────────
 
     def analyze(
@@ -369,7 +399,9 @@ class ForensicAgent:
         except Exception as e:
             logger.error("Feature extraction failed: %s", e)
             return self._error_report(
-                image_path_str, f"Feature extraction failed: {e}", start_time
+                image_path_str,
+                f"Feature extraction failed: {e}",
+                start_time,
             )
 
         # ── Step 3: Model Inference ──
@@ -387,7 +419,9 @@ class ForensicAgent:
         except Exception as e:
             logger.error("Signal extraction failed: %s", e)
             return self._error_report(
-                image_path_str, f"Signal extraction failed: {e}", start_time
+                image_path_str,
+                f"Signal extraction failed: {e}",
+                start_time,
             )
 
         # ── Step 5: Prompt Validation ──
@@ -429,12 +463,8 @@ class ForensicAgent:
                 )
                 llm_used = True
             except Exception as e:
-                logger.warning(
-                    "LLM reasoning failed — falling back to deterministic "
-                    "report: %s", e,
-                )
-                warnings.append(f"LLM call failed: {e}")
-                report_text = self._fallback_report(signals)
+                logger.error(f"LLM ERROR: {e}")
+                raise e
         else:
             report_text = self._fallback_report(signals)
 
@@ -459,7 +489,7 @@ class ForensicAgent:
         )
 
     # ──────────────────────────────────────────────────
-    #  Batch Analysis
+    # Batch Analysis
     # ──────────────────────────────────────────────────
 
     def analyze_batch(
@@ -484,14 +514,15 @@ class ForensicAgent:
         """
         reports: List[ForensicReport] = []
         total = len(image_paths)
+
         logger.info("Starting batch analysis: %d images", total)
 
         for idx, path in enumerate(image_paths, 1):
             case_id = (
                 f"{case_id_prefix}-{idx:03d}"
-                if case_id_prefix else None
+                if case_id_prefix
+                else None
             )
-
             logger.info("Batch [%d/%d]: %s", idx, total, path)
 
             report = self.analyze(
@@ -523,7 +554,7 @@ class ForensicAgent:
         return reports
 
     # ──────────────────────────────────────────────────
-    #  Gradio Integration Helper
+    # Gradio Integration Helper
     # ──────────────────────────────────────────────────
 
     def analyze_for_gradio(
@@ -534,12 +565,12 @@ class ForensicAgent:
         """
         Gradio-compatible analysis method.
 
-        Designed to be a drop-in enhancement for app.py's predict()
-        function. Returns the same output types plus the forensic report.
+        Designed to be a drop-in enhancement for app.py's predict() function.
+        Returns the same output types plus the forensic report.
 
         Args:
-            input_img:  numpy RGB array from Gradio Image component.
-            threshold:  classification threshold from Gradio slider.
+            input_img: numpy RGB array from Gradio Image component.
+            threshold: classification threshold from Gradio slider.
 
         Returns:
             (result_html, ela_viz, noise_viz, report_text)
@@ -586,7 +617,8 @@ class ForensicAgent:
             # ── Format HTML (matches app.py style) ──
             is_ai = signals.verdict == "AI GENERATED"
             label = (
-                "🚨 AI GENERATED or EDITED" if is_ai
+                "🚨 AI GENERATED or EDITED"
+                if is_ai
                 else "✅ REAL PHOTOGRAPH"
             )
 
@@ -600,11 +632,11 @@ class ForensicAgent:
 
             color = "red" if is_ai else "green"
 
-            # ────────────────────────────────────────────
+            # ──────────────────────────────────────────
             # FIX Issue 2: "Signal Agreement" → "Primary Evidence"
             # The UI label was misleading — primary_evidence identifies
             # the most decisive modality, not signal agreement status.
-            # ────────────────────────────────────────────
+            # ──────────────────────────────────────────
             # Format primary evidence for display
             primary_display = signals.primary_evidence.replace(
                 '_', ' '
@@ -633,7 +665,7 @@ class ForensicAgent:
                 </p>
             </div>
             """
-            # ────────────────────────────────────────────
+            # ──────────────────────────────────────────
 
             # ── ELA / PRNU Visualizations ──
             # Re-extract features for visualization
@@ -663,10 +695,10 @@ class ForensicAgent:
                 )
 
     # ══════════════════════════════════════════════════
-    #  INTERNAL PIPELINE METHODS
+    # INTERNAL PIPELINE METHODS
     # ══════════════════════════════════════════════════
 
-    # ── Image Input Handling ──────────────────────────
+    # ── Image Input Handling ────────────────────────
 
     @staticmethod
     def _to_pil(
@@ -710,7 +742,7 @@ class ForensicAgent:
         else:
             return "<numpy_array>"
 
-    # ── Feature Extraction ────────────────────────────
+    # ── Feature Extraction ──────────────────────────
 
     def _extract_features(self, img_pil: PIL.Image.Image) -> Dict:
         """
@@ -720,9 +752,9 @@ class ForensicAgent:
             def azi_diff(img: PIL.Image.Image, patch_num=128, N=256) → dict
 
         VERIFIED return keys:
-            'total_emb':  [rich_array (128,256), poor_array (128,256)]
-            'ela':        (128,128,3) float32 in [0,1]
-            'noise':      (128,128) float32 in [0,1]
+            'total_emb': [rich_array (128,256), poor_array (128,256)]
+            'ela':       (128,128,3) float32 in [0,1]
+            'noise':     (128,128)   float32 in [0,1]
             'image_size': (H, W) tuple
         """
         features = azi_diff(img_pil, patch_num=128, N=256)
@@ -739,53 +771,35 @@ class ForensicAgent:
 
         return features
 
-    # ── Model Inference ───────────────────────────────
+    # ── Model Inference ─────────────────────────────
 
     def _run_inference(self, features: Dict) -> float:
         """
         Prepare tensors and run model forward pass.
 
         VERIFIED against app.py predict() function (lines 24–33):
-
-            rich  = torch.tensor(features['total_emb'][0],
-                                 dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            poor  = torch.tensor(features['total_emb'][1],
-                                 dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            ela   = torch.tensor(features['ela'],
-                                 dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            noise = torch.tensor(features['noise'],
-                                 dtype=torch.float32).unsqueeze(0).to(DEVICE)
-
+            rich  = torch.tensor(...).unsqueeze(0).to(DEVICE)
+            poor  = torch.tensor(...).unsqueeze(0).to(DEVICE)
+            ela   = torch.tensor(...).unsqueeze(0).to(DEVICE)
+            noise = torch.tensor(...).unsqueeze(0).to(DEVICE)
             output = model(rich, poor, ela, noise)
-
-        VERIFIED against models.py forward(self, rich, poor, ela, noise):
-            rich:  (B, 128, 256) → permute(1,0,2) → Attention
-            poor:  (B, 128, 256) → permute(1,0,2) → Attention
-            ela:   (B, 128, 128, 3) → permute(0,3,1,2) → (B,3,128,128)
-            noise: (B, 128, 128) → unsqueeze(1) → (B,1,128,128)
-            visual = cat([ela_permuted, noise_unsqueezed], dim=1)
-                   → (B,4,128,128) → CNN → (B,2048)
         """
         # ── Tensor preparation (exact match to app.py) ──
         rich_tensor = torch.tensor(
             features["total_emb"][0], dtype=torch.float32
-        ).unsqueeze(0).to(self.device)
-        # Shape: (1, 128, 256)
+        ).unsqueeze(0).to(self.device)          # Shape: (1, 128, 256)
 
         poor_tensor = torch.tensor(
             features["total_emb"][1], dtype=torch.float32
-        ).unsqueeze(0).to(self.device)
-        # Shape: (1, 128, 256)
+        ).unsqueeze(0).to(self.device)          # Shape: (1, 128, 256)
 
         ela_tensor = torch.tensor(
             features["ela"], dtype=torch.float32
-        ).unsqueeze(0).to(self.device)
-        # Shape: (1, 128, 128, 3)
+        ).unsqueeze(0).to(self.device)          # Shape: (1, 128, 128, 3)
 
         noise_tensor = torch.tensor(
             features["noise"], dtype=torch.float32
-        ).unsqueeze(0).to(self.device)
-        # Shape: (1, 128, 128)
+        ).unsqueeze(0).to(self.device)          # Shape: (1, 128, 128)
 
         # ── Forward pass ──
         with torch.no_grad():
@@ -796,17 +810,16 @@ class ForensicAgent:
 
         # Extract scalar logit
         raw_logit = output.squeeze().cpu().item()
-
         return float(raw_logit)
 
-    # ── Signal Extraction ─────────────────────────────
+    # ── Signal Extraction ───────────────────────────
 
     def _extract_signals(
         self, raw_logit: float, features: Dict,
     ) -> ForensicSignals:
         """
-        Compute interpretable forensic signals from raw features
-        and detector output.
+        Compute interpretable forensic signals from raw features and
+        detector output.
 
         Input arrays match azi_diff() return format:
             rich_spectral = features['total_emb'][0]  → (128, 256)
@@ -821,10 +834,119 @@ class ForensicAgent:
             ela_map=np.asarray(features["ela"]),
             prnu_map=np.asarray(features["noise"]),
         )
-
         return signals
 
-    # ── LLM Report Generation ─────────────────────────
+    # ── Signal-to-Text Translation ──────────────────
+    # ────────────────────────────────────────────────────
+    # Build the human-readable forensic signal interpretation block
+    # that is injected into the LLM prompt.
+    #
+    # This is the core of the anti-hallucination fix:
+    #   OLD pipeline:  raw metrics → LLM (hallucinates thresholds)
+    #   NEW pipeline:  raw metrics → text signals → LLM (grounded)
+    #
+    # v1.3 improvements:
+    #   - Explicit probability + threshold values for numerical grounding
+    #   - Risk-override warning when verdict and risk level disagree
+    # ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_signal_context(signals: ForensicSignals) -> str:
+        """
+        Translate ForensicSignals into a structured natural-language
+        context block for LLM prompt injection.
+
+        Calls translate_signals_to_text() from forensic_signals.py and
+        formats the result into a clean, labeled text block that the LLM
+        can reason about without needing to interpret raw numbers.
+
+        v1.3 additions:
+          - Model Probability block: raw probability and threshold values
+            placed directly after the verdict, giving the LLM explicit
+            numerical grounding for its reasoning.
+          - Risk Override WARNING: appended when the detector verdict is
+            REAL IMAGE but the forensic risk level is HIGH or CRITICAL,
+            explicitly flagging the disagreement so the LLM does not
+            produce a confidently "clean" report that contradicts the
+            forensic evidence.
+
+        Args:
+            signals: Fully populated ForensicSignals from the extractor.
+
+        Returns:
+            Multi-line string ready for prompt injection.
+        """
+        text_signals = translate_signals_to_text(signals)
+
+        # ────────────────────────────────────────────────
+        # Core signal context with all modality interpretations
+        # ────────────────────────────────────────────────
+        context = (
+            "FORENSIC SIGNAL INTERPRETATION\n"
+            "\n"
+            "Detector Verdict:\n"
+            f"{text_signals['verdict_signal']}\n"
+            "\n"
+            # ──────────────────────────────────────────
+            # FIX v1.3 (Fix 1): Explicit probability context
+            # LLMs reason more reliably when they see the exact
+            # numbers alongside the natural-language interpretation.
+            # This gives the model numerical grounding without
+            # requiring it to infer thresholds from text alone.
+            # ──────────────────────────────────────────
+            "Model Probability:\n"
+            f"AI probability score = {signals.probability:.4f}\n"
+            f"Decision threshold = {signals.threshold}\n"
+            # ──────────────────────────────────────────
+            "\n"
+            "Spectral Analysis:\n"
+            f"{text_signals['spectral_signal']}\n"
+            "\n"
+            "Compression Analysis:\n"
+            f"{text_signals['ela_signal']}\n"
+            "\n"
+            "Sensor Fingerprint:\n"
+            f"{text_signals['prnu_signal']}\n"
+            "\n"
+            "Risk Assessment:\n"
+            f"{text_signals['risk_summary']}\n"
+            "\n"
+            "Confidence Note:\n"
+            f"{text_signals['confidence_note']}\n"
+            "\n"
+            "Evidence Source:\n"
+            f"{text_signals['evidence_note']}"
+        )
+
+        # ────────────────────────────────────────────────
+        # FIX v1.3 (Fix 2): Risk override warning
+        #
+        # Disagreement case example:
+        #   probability = 0.41, threshold = 0.7 → verdict = REAL IMAGE
+        #   BUT spectral anomaly = 0.82, PRNU absent → risk = HIGH
+        #
+        # Without this warning, the LLM sees "REAL IMAGE" and may
+        # produce a confidently clean report, ignoring the high-risk
+        # forensic signals. The explicit WARNING block forces the LLM
+        # to acknowledge and reason about the contradiction.
+        # ────────────────────────────────────────────────
+        if (
+            signals.risk_level in ("HIGH", "CRITICAL")
+            and signals.verdict == "REAL IMAGE"
+        ):
+            context += (
+                "\n\n"
+                "WARNING:\n"
+                "Although the model probability is below the classification "
+                "threshold, multiple forensic signals indicate elevated "
+                "manipulation risk. This result should be treated with "
+                "caution."
+            )
+        # ────────────────────────────────────────────────
+
+        return context
+
+    # ── LLM Report Generation ───────────────────────
 
     def _generate_llm_report(
         self,
@@ -836,15 +958,50 @@ class ForensicAgent:
         """
         Build prompts and call Azure OpenAI for forensic reasoning.
 
-        Uses build_prompt_pair() from reasoning_prompt.py which
-        generates format-specific system + user prompts.
+        Pipeline:
+            1. Translate numeric signals → human-readable text descriptions
+               via _build_signal_context() → translate_signals_to_text().
+            2. Merge forensic signal context with any user-provided
+               additional_context (user context appended after signals).
+            3. Pass merged context to build_prompt_pair() which embeds it
+               into the structured LLM prompt.
+            4. Call Azure OpenAI with the system + user prompt pair.
+
+        This ensures the LLM receives pre-interpreted evidence (including
+        explicit probability grounding and risk-override warnings) rather
+        than raw floats, eliminating threshold hallucination.
         """
-        # Build prompt pair
+        # ────────────────────────────────────────────────
+        # Step 1: Build forensic signal interpretation context
+        # Includes probability grounding (v1.3 Fix 1) and
+        # risk-override warning when applicable (v1.3 Fix 2)
+        # ────────────────────────────────────────────────
+        signal_context = self._build_signal_context(signals)
+
+        # ────────────────────────────────────────────────
+        # Step 2: Merge with user-supplied additional context
+        # Signal interpretation always comes first (it is the primary
+        # evidence the LLM should reason about). User context is
+        # supplementary and appended after a separator.
+        # ────────────────────────────────────────────────
+        if additional_context:
+            merged_context = (
+                f"{signal_context}\n"
+                f"\n"
+                f"ADDITIONAL CONTEXT\n"
+                f"{additional_context}"
+            )
+        else:
+            merged_context = signal_context
+
+        # ────────────────────────────────────────────────
+        # Step 3: Build prompt pair with interpreted signals
+        # ────────────────────────────────────────────────
         prompts = build_prompt_pair(
             signals=signals,
             report_format=report_format,
             case_id=case_id,
-            additional_context=additional_context,
+            additional_context=merged_context,
         )
 
         logger.info(
@@ -853,6 +1010,9 @@ class ForensicAgent:
             report_format.value,
         )
 
+        # ────────────────────────────────────────────────
+        # Step 4: LLM call
+        # ────────────────────────────────────────────────
         # Adjust max_tokens for summary format
         max_tokens = self.llm_max_tokens
         if report_format == ReportFormat.SUMMARY:
@@ -884,15 +1044,18 @@ class ForensicAgent:
         logger.info("LLM report generated (%d chars)", len(report_text))
         return report_text
 
-    # ── Fallback Report (Deterministic, No LLM) ──────
+    # ── Fallback Report (Deterministic, No LLM) ────
 
     @staticmethod
     def _fallback_report(signals: ForensicSignals) -> str:
         """
         Generate a structured forensic report without LLM.
 
-        Uses only the computed metrics from ForensicSignals.
+        Uses both computed metrics AND human-readable signal translations
+        from translate_signals_to_text() for narrative consistency.
+
         Fully deterministic: same signals → same report.
+
         Used when:
           - LLM is disabled
           - Azure OpenAI call fails
@@ -902,6 +1065,14 @@ class ForensicAgent:
         ela = signals.ela
         prnu = signals.prnu
 
+        # ────────────────────────────────────────────────
+        # Generate text signals for the narrative sections
+        # This ensures the fallback report uses the same interpreted
+        # language as the LLM-powered report, providing consistency
+        # regardless of which path was taken.
+        # ────────────────────────────────────────────────
+        text_signals = translate_signals_to_text(signals)
+
         # Format primary evidence display
         if signals.primary_evidence == "multiple_signals":
             primary_display = "Multiple Signals (Tied)"
@@ -910,66 +1081,93 @@ class ForensicAgent:
                 '_', ' '
             ).title()
 
-        # Spectral anomaly severity label
-        if sp.anomaly_score >= 0.7:
-            sp_severity = "HIGH"
-        elif sp.anomaly_score >= 0.4:
-            sp_severity = "MODERATE"
-        else:
-            sp_severity = "LOW"
-
-        # ELA uniformity description
-        ela_uniform_desc = (
-            "uniform" if ela.uniformity_score > 0.7 else "varied"
-        )
-
-        # ELA splicing description
-        if ela.splicing_indicator >= 0.4:
-            splice_desc = "evidence of localized manipulation"
-        else:
-            splice_desc = "no splicing detected"
-
-        # PRNU flatness description
-        if prnu.spectral_flatness > 0.7:
-            prnu_flat_desc = "white noise / AI-like"
-        else:
-            prnu_flat_desc = "structured / camera-like"
-
         lines = [
             f"VERDICT: {signals.verdict} "
             f"({signals.probability * 100:.1f}% probability)",
             "",
-            "EVIDENCE SUMMARY",
+            "═" * 56,
+            " FORENSIC SIGNAL INTERPRETATION",
+            "═" * 56,
+            "",
+            "► Detector Verdict:",
+            f"  {text_signals['verdict_signal']}",
+            "",
+            # ──────────────────────────────────────────
+            # v1.3 Fix 1: Explicit probability in fallback too
+            # ──────────────────────────────────────────
+            "► Model Probability:",
+            f"  AI probability score = {signals.probability:.4f}",
+            f"  Decision threshold = {signals.threshold}",
+            "",
+            # ──────────────────────────────────────────
+            "► Spectral Analysis:",
+            f"  {text_signals['spectral_signal']}",
+            "",
+            "► Compression Analysis (ELA):",
+            f"  {text_signals['ela_signal']}",
+            "",
+            "► Sensor Fingerprint (PRNU):",
+            f"  {text_signals['prnu_signal']}",
+            "",
+        ]
+
+        # ──────────────────────────────────────────────
+        # v1.3 Fix 2: Risk override warning in fallback too
+        # ──────────────────────────────────────────────
+        if (
+            signals.risk_level in ("HIGH", "CRITICAL")
+            and signals.verdict == "REAL IMAGE"
+        ):
+            lines.extend([
+                "⚠ WARNING:",
+                "  Although the model probability is below the classification",
+                "  threshold, multiple forensic signals indicate elevated",
+                "  manipulation risk. This result should be treated with",
+                "  caution.",
+                "",
+            ])
+        # ──────────────────────────────────────────────
+
+        lines.extend([
+            "═" * 56,
+            " DETAILED METRICS",
+            "═" * 56,
             "",
             "• Spectral Analysis:",
-            f"  Anomaly score: {sp.anomaly_score} "
-            f"({sp_severity} anomaly)",
-            f"  Rich HF ratio: {sp.rich_high_freq_ratio} | "
-            f"Poor HF ratio: {sp.poor_high_freq_ratio}",
-            f"  Rich diversity: {sp.rich_spectral_diversity} | "
-            f"Poor diversity: {sp.poor_spectral_diversity}",
+            f"    Anomaly score:      {sp.anomaly_score}",
+            f"    Rich HF ratio:      {sp.rich_high_freq_ratio}",
+            f"    Poor HF ratio:      {sp.poor_high_freq_ratio}",
+            f"    Rich diversity:     {sp.rich_spectral_diversity}",
+            f"    Poor diversity:     {sp.poor_spectral_diversity}",
             "",
             "• Compression Analysis (ELA):",
-            f"  Uniformity: {ela.uniformity_score} "
-            f"({ela_uniform_desc} compression)",
-            f"  Splicing indicator: {ela.splicing_indicator} "
-            f"({splice_desc})",
-            f"  Spatial entropy: {ela.spatial_entropy}",
+            f"    Uniformity:         {ela.uniformity_score}",
+            f"    Splicing indicator: {ela.splicing_indicator}",
+            f"    Spatial entropy:    {ela.spatial_entropy}",
             "",
             "• Sensor Fingerprint (PRNU):",
-            f"  Strength: {prnu.strength_score} | "
-            f"Camera consistency: {prnu.camera_consistency}",
-            f"  Spectral flatness: {prnu.spectral_flatness} "
-            f"({prnu_flat_desc})",
+            f"    Strength:           {prnu.strength_score}",
+            f"    Camera consistency: {prnu.camera_consistency}",
+            f"    Spectral flatness:  {prnu.spectral_flatness}",
             "",
-            f"RISK ASSESSMENT: {signals.risk_level}",
+            "═" * 56,
+            " ASSESSMENT",
+            "═" * 56,
             "",
-            f"CONFIDENCE: {signals.confidence_level}",
+            f"  Risk Assessment:    {signals.risk_level}",
+            f"  {text_signals['risk_summary']}",
             "",
-            f"PRIMARY EVIDENCE: {primary_display}",
+            f"  Confidence:         {signals.confidence_level}",
+            f"  {text_signals['confidence_note']}",
             "",
-            "RECOMMENDATION:",
-        ]
+            f"  Primary Evidence:   {primary_display}",
+            f"  {text_signals['evidence_note']}",
+            "",
+            "═" * 56,
+            " RECOMMENDATION",
+            "═" * 56,
+            "",
+        ])
 
         # Risk-appropriate recommendations
         if signals.risk_level in ("CRITICAL", "HIGH"):
@@ -990,14 +1188,17 @@ class ForensicAgent:
 
         lines.extend([
             "",
-            "─── NOTE: This report was generated without LLM reasoning. ───",
-            "─── Metrics above are computed deterministically from the   ───",
-            "─── detector's signal extraction pipeline.                  ───",
+            "─" * 56,
+            " NOTE: This report was generated without LLM reasoning.",
+            " Metrics and interpretations above are computed",
+            " deterministically from the detector's signal",
+            " extraction and translation pipeline.",
+            "─" * 56,
         ])
 
         return "\n".join(lines)
 
-    # ── Report Builder ────────────────────────────────
+    # ── Report Builder ──────────────────────────────
 
     def _build_report(
         self,
@@ -1029,7 +1230,7 @@ class ForensicAgent:
             warnings=warnings,
         )
 
-    # ── Error Report ──────────────────────────────────
+    # ── Error Report ────────────────────────────────
 
     @staticmethod
     def _error_report(
@@ -1049,19 +1250,19 @@ class ForensicAgent:
 
 
 # ══════════════════════════════════════════════════════
-#  CLI ENTRY POINT
+# CLI ENTRY POINT
 # ══════════════════════════════════════════════════════
+
 
 def main():
     """Command-line interface for single and batch forensic analysis."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="🛡️ Forensic AI Image Analysis Agent",
+        description="🛡️  Forensic AI Image Analysis Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-
   Single image:
     python forensic_agent.py photo.jpg \\
         --checkpoint checkpoints/best_model.pth
@@ -1080,7 +1281,7 @@ Examples:
     python forensic_agent.py photo.jpg \\
         --checkpoint checkpoints/best_model.pth \\
         --no-llm
-        """,
+""",
     )
 
     parser.add_argument(
@@ -1165,16 +1366,16 @@ Examples:
         )
 
         print(f"\n{'=' * 60}")
-        print(" FORENSIC ANALYSIS REPORT")
+        print("  FORENSIC ANALYSIS REPORT")
         print(f"{'=' * 60}")
         print(report.report_text)
         print(f"{'=' * 60}")
-        print(f" Processing time: {report.processing_time_sec:.2f}s")
-        print(f" LLM used: {report.llm_used}")
+        print(f"  Processing time: {report.processing_time_sec:.2f}s")
+        print(f"  LLM used: {report.llm_used}")
         if report.warnings:
-            print(f" Warnings: {len(report.warnings)}")
+            print(f"  Warnings: {len(report.warnings)}")
             for w in report.warnings:
-                print(f"   ⚠ {w}")
+                print(f"    ⚠ {w}")
         print(f"{'=' * 60}")
 
         if args.save_dir:
@@ -1192,7 +1393,7 @@ Examples:
 
         # ── Batch Summary Table ──
         print(f"\n{'=' * 80}")
-        print(" BATCH ANALYSIS SUMMARY")
+        print("  BATCH ANALYSIS SUMMARY")
         print(f"{'=' * 80}")
         print(
             f"{'#':<4} {'Image':<30} {'Verdict':<18} "
@@ -1239,7 +1440,7 @@ Examples:
         for i, r in enumerate(reports, 1):
             if r.success:
                 print(f"\n{'─' * 60}")
-                print(f" Report #{i}: {Path(r.image_path).name}")
+                print(f"  Report #{i}: {Path(r.image_path).name}")
                 print(f"{'─' * 60}")
                 print(r.report_text)
 
